@@ -9,6 +9,7 @@ export interface ExtractedPost {
   images: string[];
   publishedAt: string;
   groupUrl: string;
+  isShare?: boolean;
 }
 
 const PET_KEYWORDS = [
@@ -21,29 +22,32 @@ const PET_KEYWORDS = [
   'mi perro', 'mi perra', 'mi gato', 'mi gata', 'mi mascota',
 ];
 
-function looksLikeLostPet(text: string): boolean {
-  if (!text || text.length < 15) return false;
+// Si hay texto: evalúa keywords.
+// Si no hay texto pero hay imágenes: pasa igual (imagen de mascota sin texto en DOM).
+function looksLikeLostPet(text: string, hasImages: boolean): boolean {
+  if (!text || text.length < 15) return hasImages;
   const lower = text.toLowerCase();
   return PET_KEYWORDS.some((kw) => lower.includes(kw));
 }
 
-const SCROLL_DOWN_FN = `
+// Desplaza al fondo absoluto del documento para activar el IntersectionObserver
+// (sentinel de infinite scroll de Facebook). window.scrollBy no lo dispara de forma fiable.
+const SCROLL_TO_BOTTOM_FN = `
   (() => {
-    const main = document.querySelector('[role="main"]');
-    if (main && main.scrollHeight > main.clientHeight) {
-      main.scrollTop += 800;
-      return true;
-    }
-    const doc = document.scrollingElement || document.documentElement;
-    doc.scrollTop += 800;
-    return true;
+    window.scrollTo(0, document.body.scrollHeight);
+    return document.body.scrollHeight;
   })()
 `;
 
-/**
- * Extrae posts visibles del grupo. Hace scroll N veces y captura cada post
- * con su autor, texto, imágenes y URL. Filtra por palabras clave de mascotas.
- */
+// Hook para enriquecer un share llegando al post original.
+// V1: no-op — confiamos en la preview embebida (texto + imágenes + URL original) extraída inline.
+// V2 (futuro): abrir page.context().newPage(), navegar a post.postUrl (que ya es la URL del
+//   original), extraer el DOM del detalle del post, y devolver el `post` enriquecido. La firma
+//   y el punto de llamada ya están en su sitio para que el cambio sea local a esta función.
+async function resolveOriginalPost(_page: Page, post: ExtractedPost): Promise<ExtractedPost> {
+  return post;
+}
+
 export async function extractPostsFromGroup(
   page: Page,
   groupUrl: string,
@@ -58,95 +62,304 @@ export async function extractPostsFromGroup(
 
   await page.waitForTimeout(randomDelay(3000, 5000));
 
+  const isLoginPage = await page.evaluate(() =>
+    document.querySelector('input[name="email"], form[action*="login"]') !== null
+  );
+  if (isLoginPage) throw new Error('Sesión expirada — volver a iniciar sesión en Cuentas');
+
   const postsMap = new Map<string, ExtractedPost>();
+  let captureRound = 0;
 
   const capture = async () => {
-    const captured = await page.evaluate((groupUrl): ExtractedPost[] => {
+    captureRound++;
+    type EvalResult = { posts: ExtractedPost[]; logs: string[] };
+
+    const { posts: captured, logs } = await page.evaluate((groupUrl): EvalResult => {
+      const logs: string[] = [];
       const out: ExtractedPost[] = [];
 
       const articles = document.querySelectorAll('[role="article"]');
-      for (const art of Array.from(articles)) {
+      logs.push(`articles en DOM: ${articles.length}`);
+
+      for (let idx = 0; idx < articles.length; idx++) {
+        const art = articles[idx];
         try {
           const articleEl = art as HTMLElement;
 
-          let postUrl = '';
-          const links = articleEl.querySelectorAll('a[href*="/posts/"], a[href*="/permalink/"], a[href*="/groups/"][href*="/permalink"], a[href*="?multi_permalinks="]');
-          for (const a of Array.from(links) as HTMLAnchorElement[]) {
-            const href = a.href || '';
-            if (href.includes('/posts/') || href.includes('/permalink/') || href.includes('multi_permalinks')) {
-              postUrl = href.split('?')[0].split('#')[0];
-              break;
+          // ─── 0. SOLO TOP-LEVEL ───────────────────────────────────────────────
+          // FB usa [role="article"] también para comentarios y para el preview embebido
+          // de un share. Si este article tiene un ancestro [role="article"], saltarlo.
+          if (articleEl.parentElement?.closest('[role="article"]')) {
+            logs.push(`  art[${idx}] → SKIP (anidado dentro de otro [role="article"])`);
+            continue;
+          }
+
+          // ─── 0.2. DEBE TENER BLOQUE DE AUTOR ────────────────────────────────
+          // Un post real siempre tiene [data-ad-rendering-role="profile_name"].
+          // Su ausencia descarta headers del grupo, skeletons de carga, ads sin autor, etc.
+          if (!articleEl.querySelector('[data-ad-rendering-role="profile_name"]')) {
+            logs.push(`  art[${idx}] → SKIP (sin profile_name — no es post real)`);
+            continue;
+          }
+
+          // ─── 0.5. DETECCIÓN DE SHARE (estructural) ──────────────────────────
+          // FB no siempre renderiza "compartió la publicación". Detección por estructura:
+          //   >1 profile_name (sharer + autor original)  ó
+          //   >1 story_message (comentario del sharer + texto original)
+          const profileNames = articleEl.querySelectorAll(
+            '[data-ad-rendering-role="profile_name"]'
+          ) as NodeListOf<HTMLElement>;
+          const storyMessages = articleEl.querySelectorAll(
+            '[data-ad-rendering-role="story_message"]'
+          ) as NodeListOf<HTMLElement>;
+          const isShare = profileNames.length > 1 || storyMessages.length > 1;
+
+          // Para shares: localizar el contenedor del post embebido (la "card" del original).
+          // Walk-up desde el SEGUNDO profile_name hasta encontrar un ancestro que ya contenga
+          // el contenido original (story_message o link /photo/?fbid=). Si el cursor crece
+          // hasta englobar también al sharer (primer profile_name), abortamos: significa que
+          // ya salimos de la card embebida y volveríamos a mezclar fuentes.
+          let sourceEl: HTMLElement = articleEl;
+          if (isShare && profileNames.length > 1) {
+            const sharerProfile = profileNames[0];
+            const originalProfile = profileNames[1];
+            let cursor: HTMLElement | null = originalProfile.parentElement;
+            while (cursor && cursor !== articleEl) {
+              if (cursor.contains(sharerProfile)) break;
+              const hasInnerStory = cursor.querySelector('[data-ad-rendering-role="story_message"]');
+              const hasInnerFbid = cursor.querySelector('a[href*="/photo/?fbid="]');
+              if (hasInnerStory || hasInnerFbid) {
+                sourceEl = cursor;
+                break;
+              }
+              cursor = cursor.parentElement;
             }
           }
+
+          if (isShare) {
+            logs.push(`  art[${idx}] → SHARE (profile_names=${profileNames.length}, story_msgs=${storyMessages.length}, source=${sourceEl === articleEl ? 'wrapper' : 'embebido'})`);
+          }
+
+          // ─── 1. TEXTO ────────────────────────────────────────────────────────
+          // Para shares con sourceEl=embedded: solo se extrae el story_message del original.
+          // Para shares con sourceEl=wrapper (fallback): se mezclan sharer + original, lo
+          //   cual no es ideal pero sirve para keyword matching.
+          // Su AUSENCIA combinada con presencia de imágenes = post solo-imagen (válido).
+          let text = '';
+          const textBlocks = sourceEl.querySelectorAll(
+            '[data-ad-rendering-role="story_message"], [data-ad-preview="message"], [data-ad-comet-preview="message"]'
+          );
+          if (textBlocks.length > 0) {
+            text = Array.from(textBlocks).map((b) => (b.textContent || '').trim()).join('\n');
+          }
+          if (!text) {
+            const parts: string[] = [];
+            for (const d of Array.from(sourceEl.querySelectorAll('div[dir="auto"]'))) {
+              const t = (d.textContent || '').trim();
+              if (t.length > 10 && !parts.includes(t)) parts.push(t);
+            }
+            text = parts.join('\n').trim();
+          }
+          const hasStoryMessage = textBlocks.length > 0;
+
+          // ─── 2. IMÁGENES ─────────────────────────────────────────────────────
+          // Todos los pases sobre sourceEl: para shares con embedded esto restringe a las
+          // imágenes del post original, evitando contaminar con avatares/banners del wrapper.
+          const images: string[] = [];
+          // (a) Imágenes reales del post: a[href*="/photo/?fbid="] img.
+          for (const a of Array.from(
+            sourceEl.querySelectorAll('a[href*="/photo/?fbid="]')
+          ) as HTMLAnchorElement[]) {
+            const img = a.querySelector('img') as HTMLImageElement | null;
+            if (img && img.src && !images.includes(img.src)) images.push(img.src);
+          }
+          // (b) Pase amplio: cualquier a[href*="/photo/"] que aún no haya sido capturado.
+          for (const a of Array.from(
+            sourceEl.querySelectorAll('a[href*="/photo/"]')
+          ) as HTMLAnchorElement[]) {
+            const img = a.querySelector('img') as HTMLImageElement | null;
+            if (img && img.src && !images.includes(img.src)) images.push(img.src);
+          }
+          // (c) Fallback: <img> de CDN de FB sin anchor /photo/ (layouts antiguos).
+          for (const img of Array.from(
+            sourceEl.querySelectorAll('img[src*="fbcdn"], img[src*="scontent"]')
+          ) as HTMLImageElement[]) {
+            const attrW = parseInt(img.getAttribute('width') || '0', 10);
+            const attrH = parseInt(img.getAttribute('height') || '0', 10);
+            if ((attrW > 0 && attrW < 60) || (attrH > 0 && attrH < 60)) continue;
+            if (!images.includes(img.src)) images.push(img.src);
+          }
+          const isImageOnly = !hasStoryMessage && images.length > 0;
+
+          logs.push(`  art[${idx}] text=${text.length}ch imgs=${images.length} preview="${text.slice(0, 60).replace(/\n/g, ' ')}"`);
+
+          // ─── 3. FILTRO INICIAL ───────────────────────────────────────────────
+          if (text.length < 15 && images.length === 0) {
+            logs.push(`  art[${idx}] → SKIP (sin texto ni imágenes)`);
+            continue;
+          }
+
+          // ─── 4. AUTOR ────────────────────────────────────────────────────────
+          // Para shares: queremos el autor ORIGINAL, no el sharer.
+          //   - Si sourceEl=embedded: su primer profile_name ES el original.
+          //   - Si sourceEl=wrapper: tomamos explícitamente profileNames[1].
+          let authorName = '';
+          let authorUrl = '';
+          // aria-label es más fiable que textContent en FB (texto en spans ofuscados).
+          const resolveAnchorName = (a: HTMLAnchorElement): string =>
+            (a.getAttribute('aria-label') || a.textContent || '').trim();
+
+          let profileEl: HTMLAnchorElement | null = null;
+          if (isShare && sourceEl === articleEl && profileNames.length > 1) {
+            profileEl = profileNames[1].querySelector('a') as HTMLAnchorElement | null;
+          } else {
+            profileEl = sourceEl.querySelector(
+              '[data-ad-rendering-role="profile_name"] a'
+            ) as HTMLAnchorElement | null;
+          }
+          if (profileEl) {
+            authorName = resolveAnchorName(profileEl);
+            authorUrl = profileEl.href.split('?')[0];
+          }
+          if (!authorName) {
+            const fallback = sourceEl.querySelector(
+              'a[href*="/user/"][aria-label], a[href*="/user/"][role="link"], h2 a, h3 a, strong a'
+            ) as HTMLAnchorElement | null;
+            if (fallback) {
+              authorName = resolveAnchorName(fallback);
+              authorUrl = fallback.href.split('?')[0];
+            }
+          }
+          if (!authorName) {
+            const h = sourceEl.querySelector('h2, h3, h4');
+            if (h) authorName = (h.textContent || '').trim().split('\n')[0];
+          }
+          logs.push(`  art[${idx}] autor="${authorName}" authorUrl="${authorUrl.slice(0, 60)}"`);
+
+          // ─── 5. URL DEL POST ─────────────────────────────────────────────────
+          let postUrl = '';
+          let urlStrategy = '';
+
+          // SHARE: URL canónica = la del POST ORIGINAL.
+          // Esto deduplica cuando varias personas comparten el mismo caso.
+          // Orden de búsqueda dentro de sourceEl (la card embebida si la hallamos):
+          //   1) /posts/ de un grupo DIFERENTE al actual
+          //   2) /permalink/ o story_fbid= (post de perfil personal)
+          //   3) /photo/?fbid= (cuando el original es solo-imagen y no tiene URL de post)
+          if (isShare) {
+            const gidMatch = groupUrl.match(/\/groups\/(\d+)/);
+            const currentGid = gidMatch?.[1] || '';
+            for (const a of Array.from(sourceEl.querySelectorAll(
+              'a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid="]'
+            )) as HTMLAnchorElement[]) {
+              if (!a.href || !a.href.includes('facebook.com')) continue;
+              const gm = a.href.match(/\/groups\/(\d+)\/posts\/(\d+)/);
+              if (gm && gm[1] !== currentGid) {
+                postUrl = a.href.split('?')[0].split('#')[0];
+                urlStrategy = 'SHARE-grupo-original';
+                break;
+              }
+              if (!gm && (a.href.includes('/permalink/') || a.href.includes('story_fbid='))) {
+                postUrl = a.href.split('?')[0].split('#')[0];
+                urlStrategy = 'SHARE-perfil-original';
+                break;
+              }
+            }
+            if (!postUrl) {
+              for (const a of Array.from(sourceEl.querySelectorAll(
+                'a[href*="/photo/?fbid="]'
+              )) as HTMLAnchorElement[]) {
+                const fbidMatch = a.href.match(/fbid=(\d+)/);
+                if (fbidMatch) {
+                  postUrl = `https://www.facebook.com/photo/?fbid=${fbidMatch[1]}`;
+                  urlStrategy = 'SHARE-photo-fbid';
+                  break;
+                }
+              }
+            }
+          }
+
           if (!postUrl) {
-            const timeLinks = articleEl.querySelectorAll('a[role="link"][aria-label]');
-            for (const a of Array.from(timeLinks) as HTMLAnchorElement[]) {
-              if (a.href.includes('facebook.com') && (a.href.includes('/posts') || a.href.includes('/permalink'))) {
-                postUrl = a.href.split('?')[0];
+            for (const a of Array.from(articleEl.querySelectorAll(
+              'a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid="], a[href*="/story.php"], a[href*="?multi_permalinks="]'
+            )) as HTMLAnchorElement[]) {
+              if (a.href && a.href.includes('facebook.com')) {
+                postUrl = a.href.split('?')[0].split('#')[0];
+                urlStrategy = 'E1-clasico';
                 break;
               }
             }
           }
-          if (!postUrl) continue;
 
-          let authorName = '';
-          let authorUrl = '';
-          const authorLink = articleEl.querySelector('h2 a, h3 a, strong a, [role="link"] strong') as HTMLAnchorElement | null;
-          if (authorLink) {
-            authorName = (authorLink.textContent || '').trim();
-            const parentLink = authorLink.closest('a') as HTMLAnchorElement | null;
-            if (parentLink) authorUrl = parentLink.href.split('?')[0];
-          }
-          if (!authorName) {
-            const h2 = articleEl.querySelector('h2, h3, h4');
-            if (h2) authorName = (h2.textContent || '').trim().split('\n')[0];
-          }
-
-          let text = '';
-          const textBlocks = articleEl.querySelectorAll('[data-ad-preview="message"], [data-ad-comet-preview="message"]');
-          if (textBlocks.length > 0) {
-            text = Array.from(textBlocks).map((b) => (b.textContent || '').trim()).join('\n');
-          } else {
-            const dirAuto = articleEl.querySelectorAll('div[dir="auto"]');
-            const parts: string[] = [];
-            for (const d of Array.from(dirAuto)) {
-              const t = (d.textContent || '').trim();
-              if (t.length > 20 && !parts.includes(t)) parts.push(t);
+          if (!postUrl) {
+            for (const a of Array.from(
+              articleEl.querySelectorAll('a[href*="facebook.com"]')
+            ) as HTMLAnchorElement[]) {
+              if (/\/\d{12,}(\/|$)/.test(a.href)) {
+                postUrl = a.href.split('?')[0].split('#')[0];
+                urlStrategy = 'E2-numerico';
+                break;
+              }
             }
-            text = parts.join('\n').trim();
           }
 
-          const images: string[] = [];
-          const imgs = articleEl.querySelectorAll('img[src*="fbcdn"], img[src*="scontent"]');
-          for (const img of Array.from(imgs) as HTMLImageElement[]) {
-            const rect = img.getBoundingClientRect();
-            if (rect.width < 100 || rect.height < 100) continue;
-            if (!images.includes(img.src)) images.push(img.src);
+          if (!postUrl) {
+            const groupIdMatch = groupUrl.match(/\/groups\/(\d+)/);
+            const authorIdMatch = authorUrl.match(/\/user\/(\d+)/);
+            const gid = groupIdMatch?.[1] || '';
+            const uid = authorIdMatch?.[1] || '';
+            const imgKey = images.length > 0
+              ? (images[0].split('/').pop()?.split('?')[0] || '').slice(0, 30)
+              : '';
+            const sample = text.slice(0, 120) + imgKey;
+            let h = 0;
+            for (let i = 0; i < sample.length; i++) {
+              h = (Math.imul(31, h) + sample.charCodeAt(i)) | 0;
+            }
+            const hash = Math.abs(h).toString(36);
+            if (gid) {
+              postUrl = uid
+                ? `https://www.facebook.com/groups/${gid}/posts/#${uid}-${hash}`
+                : `https://www.facebook.com/groups/${gid}/posts/#${hash}`;
+              urlStrategy = 'E3-sintetico';
+            }
           }
 
-          let publishedAt = '';
-          const timeEl = articleEl.querySelector('abbr, [aria-label*="hace"], [aria-label*="ago"]');
-          if (timeEl) publishedAt = (timeEl.getAttribute('aria-label') || timeEl.textContent || '').trim();
+          if (!postUrl) {
+            logs.push(`  art[${idx}] → SKIP (sin postUrl, ni siquiera grupoId)`);
+            continue;
+          }
+          logs.push(`  art[${idx}] postUrl="${postUrl.slice(0, 80)}" [${urlStrategy}]`);
 
-          out.push({
-            postUrl,
-            authorName,
-            authorUrl,
-            text,
-            images,
-            publishedAt,
-            groupUrl,
-          });
-        } catch { /* skip */ }
+          // ─── 6. FECHA ────────────────────────────────────────────────────────
+          // FB ofusca el texto visible del timestamp (spans reordenados por CSS).
+          // No intentamos parsearlo: dejamos vacío y eventualmente se derivará del postId
+          // (los IDs numéricos de FB son monotónicos en el tiempo).
+          const publishedAt = '';
+
+          const tags = [
+            isShare ? 'SHARE' : null,
+            isImageOnly ? 'SOLO-IMAGEN' : null,
+          ].filter(Boolean).join(' ');
+          logs.push(`  art[${idx}] → OK${tags ? ' [' + tags + ']' : ''}`);
+          out.push({ postUrl, authorName, authorUrl, text, images, publishedAt, groupUrl, isShare });
+        } catch (e: any) {
+          logs.push(`  art[${idx}] → ERROR: ${e?.message}`);
+        }
       }
 
-      return out;
+      return { posts: out, logs };
     }, groupUrl);
 
+    // Imprimir logs en la terminal de Node.js / VS Code
+    console.log(`\n[postsExtractor] ── capture() ronda ${captureRound} ──`);
+    for (const line of logs) console.log(`[postsExtractor] ${line}`);
+    console.log(`[postsExtractor] → ${captured.length} post(s) en esta pasada | acumulado: ${postsMap.size}`);
+
     for (const post of captured) {
-      if (!postsMap.has(post.postUrl)) {
-        postsMap.set(post.postUrl, post);
-      }
+      if (postsMap.has(post.postUrl)) continue;
+      const enriched = await resolveOriginalPost(page, post);
+      postsMap.set(enriched.postUrl, enriched);
     }
   };
 
@@ -155,9 +368,17 @@ export async function extractPostsFromGroup(
   let prevSize = postsMap.size;
   let stableRounds = 0;
 
+  // Tamaño del viewport para centrar el mouse (necesario para que mouse.wheel funcione)
+  const vp = page.viewportSize() ?? { width: 1280, height: 720 };
+
   for (let i = 0; i < maxScrolls; i++) {
-    await page.evaluate(SCROLL_DOWN_FN);
-    await page.waitForTimeout(randomDelay(1500, 2800));
+    // 1. Scroll al fondo absoluto → activa el IntersectionObserver del sentinel de Facebook
+    await page.evaluate(SCROLL_TO_BOTTOM_FN);
+    // 2. mouse.wheel simula interacción real del usuario, refuerza el scroll event
+    await page.mouse.move(vp.width / 2, vp.height / 2);
+    await page.mouse.wheel(0, 1500);
+    // 3. Esperar a que Facebook cargue el lote nuevo de posts
+    await page.waitForTimeout(randomDelay(3000, 5000));
     await capture();
 
     if (postsMap.size === prevSize) {
@@ -174,7 +395,9 @@ export async function extractPostsFromGroup(
   }
 
   const all = Array.from(postsMap.values());
-  const filtered = onlyLostPets ? all.filter((p) => looksLikeLostPet(p.text)) : all;
+  const filtered = onlyLostPets
+    ? all.filter((p) => looksLikeLostPet(p.text, p.images.length > 0))
+    : all;
 
   console.log(`[postsExtractor] Total: ${all.length} posts, ${filtered.length} relevantes`);
   return filtered;

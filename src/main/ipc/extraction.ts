@@ -119,7 +119,7 @@ async function runExtractionJob(): Promise<void> {
 
       const ua = randomUserAgent();
       context = await chromium.launchPersistentContext(profileDir, {
-        headless: true,
+        headless: false,
         executablePath: execPath,
         ignoreDefaultArgs: ['--enable-automation'],
         args: [
