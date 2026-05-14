@@ -1,4 +1,7 @@
 import { Page } from 'playwright-core';
+import { app } from 'electron';
+import * as fs from 'fs';
+import * as path from 'path';
 import { randomDelay, safeGoto } from './helpers';
 
 export interface ExtractedPost {
@@ -60,12 +63,82 @@ export async function extractPostsFromGroup(
   const ok = await safeGoto(page, groupUrl, 60000);
   if (!ok) return [];
 
-  await page.waitForTimeout(randomDelay(3000, 5000));
+  // Espera generosa para dar tiempo al primer render del feed
+  await page.waitForTimeout(randomDelay(7000, 10000));
 
   const isLoginPage = await page.evaluate(() =>
     document.querySelector('input[name="email"], form[action*="login"]') !== null
   );
   if (isLoginPage) throw new Error('Sesión expirada — volver a iniciar sesión en Cuentas');
+
+  // ─── DIAGNÓSTICO FORENSE ─────────────────────────────────────────────────
+  // Vuelca: screenshot + HTML completo + métricas DOM clave + URL final.
+  // Carpeta: %APPDATA%\automatizacion-mascotas\debug\
+  try {
+    const debugDir = path.join(app.getPath('userData'), 'debug');
+    fs.mkdirSync(debugDir, { recursive: true });
+    const gidMatch = groupUrl.match(/\/groups\/([^/?]+)/);
+    const slug = (gidMatch?.[1] || 'unknown').replace(/[^a-zA-Z0-9_-]/g, '_');
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const baseName = `${slug}_${ts}`;
+
+    const diag = await page.evaluate(() => {
+      const q = (s: string) => document.querySelectorAll(s).length;
+      const text = (s: string) => (document.querySelector(s)?.textContent || '').trim().slice(0, 200);
+      const bodyText = (document.body?.innerText || '').slice(0, 3000);
+      const buttons = Array.from(document.querySelectorAll('div[role="button"], a[role="button"], button')) as HTMLElement[];
+      const joinBtn = buttons.find((b) => /unirse|únete|join group|join this group/i.test(b.innerText || ''));
+      return {
+        finalUrl: location.href,
+        title: document.title,
+        counts: {
+          roleFeed: q('[role="feed"]'),
+          roleArticle: q('[role="article"]'),
+          groupFeedPagelet: q('[data-pagelet*="GroupFeed"], [data-pagelet*="Group"]'),
+          feedUnit: q('[data-pagelet*="FeedUnit"], [data-pagelet*="FeedUnit_"]'),
+          profileName: q('[data-ad-rendering-role="profile_name"]'),
+          storyMessage: q('[data-ad-rendering-role="story_message"]'),
+          adPreviewMsg: q('[data-ad-preview="message"], [data-ad-comet-preview="message"]'),
+          divDirAuto: q('div[dir="auto"]'),
+          fbcdnImgs: q('img[src*="fbcdn"], img[src*="scontent"]'),
+          photoLinks: q('a[href*="/photo/?fbid="], a[href*="/photo/"]'),
+          loginForm: q('input[name="email"], form[action*="login"]'),
+        },
+        joinButtonText: joinBtn ? (joinBtn.innerText || '').slice(0, 80) : null,
+        checkpointHint: /checkpoint|security check|verifica tu identidad|confirma tu identidad/i.test(bodyText),
+        notAvailableHint: /no disponible|content not available|isn't available|este contenido no está disponible/i.test(bodyText),
+        h1: text('h1'),
+        h2First: text('h2'),
+        bodyPreview: bodyText.replace(/\s+/g, ' ').slice(0, 800),
+      };
+    });
+
+    const screenshotPath = path.join(debugDir, `${baseName}.png`);
+    await page.screenshot({ path: screenshotPath, fullPage: false });
+
+    const htmlPath = path.join(debugDir, `${baseName}.html`);
+    const html = await page.content();
+    fs.writeFileSync(htmlPath, html, 'utf8');
+
+    const diagPath = path.join(debugDir, `${baseName}.json`);
+    fs.writeFileSync(diagPath, JSON.stringify(diag, null, 2), 'utf8');
+
+    console.log(`\n[postsExtractor] ─── DIAGNÓSTICO ───`);
+    console.log(`[postsExtractor] finalUrl    : ${diag.finalUrl}`);
+    console.log(`[postsExtractor] title       : ${diag.title}`);
+    console.log(`[postsExtractor] h1          : "${diag.h1}"`);
+    console.log(`[postsExtractor] counts      : ${JSON.stringify(diag.counts)}`);
+    console.log(`[postsExtractor] joinButton  : ${diag.joinButtonText ? `"${diag.joinButtonText}"` : 'no'}`);
+    console.log(`[postsExtractor] checkpoint  : ${diag.checkpointHint}`);
+    console.log(`[postsExtractor] notAvailable: ${diag.notAvailableHint}`);
+    console.log(`[postsExtractor] bodyPreview : ${diag.bodyPreview.slice(0, 300)}...`);
+    console.log(`[postsExtractor] → screenshot: ${screenshotPath}`);
+    console.log(`[postsExtractor] → html:       ${htmlPath}`);
+    console.log(`[postsExtractor] → diag:       ${diagPath}`);
+    console.log(`[postsExtractor] ───────────────────\n`);
+  } catch (e: any) {
+    console.log(`[postsExtractor] (diagnóstico falló: ${e?.message})`);
+  }
 
   const postsMap = new Map<string, ExtractedPost>();
   let captureRound = 0;
@@ -78,29 +151,35 @@ export async function extractPostsFromGroup(
       const logs: string[] = [];
       const out: ExtractedPost[] = [];
 
-      const articles = document.querySelectorAll('[role="article"]');
-      logs.push(`articles en DOM: ${articles.length}`);
+      // ─── DETECTAR WRAPPERS DE POSTS ─────────────────────────────────────────
+      // Layout moderno de FB en grupos: los posts NO están en [role="article"]
+      // (eso lo usa el composer y widgets). Cada post es un hijo directo de
+      // [role="feed"], y se identifica por contener un profile_name.
+      // Fallback: layouts viejos donde sí se usa [role="article"] top-level.
+      const feedEl = document.querySelector('[role="feed"]');
+      const wrappers: HTMLElement[] = [];
+      let detectionStrategy = '';
+      if (feedEl) {
+        for (const child of Array.from(feedEl.children) as HTMLElement[]) {
+          if (child.querySelector('[data-ad-rendering-role="profile_name"]')) {
+            wrappers.push(child);
+          }
+        }
+        detectionStrategy = `feed-children (${wrappers.length}/${feedEl.children.length})`;
+      }
+      if (wrappers.length === 0) {
+        for (const a of Array.from(document.querySelectorAll('[role="article"]')) as HTMLElement[]) {
+          if (a.parentElement?.closest('[role="article"]')) continue;
+          if (!a.querySelector('[data-ad-rendering-role="profile_name"]')) continue;
+          wrappers.push(a);
+        }
+        detectionStrategy = `fallback role=article (${wrappers.length})`;
+      }
+      logs.push(`wrappers detectados: ${wrappers.length} [${detectionStrategy}]`);
 
-      for (let idx = 0; idx < articles.length; idx++) {
-        const art = articles[idx];
+      for (let idx = 0; idx < wrappers.length; idx++) {
+        const articleEl = wrappers[idx];
         try {
-          const articleEl = art as HTMLElement;
-
-          // ─── 0. SOLO TOP-LEVEL ───────────────────────────────────────────────
-          // FB usa [role="article"] también para comentarios y para el preview embebido
-          // de un share. Si este article tiene un ancestro [role="article"], saltarlo.
-          if (articleEl.parentElement?.closest('[role="article"]')) {
-            logs.push(`  art[${idx}] → SKIP (anidado dentro de otro [role="article"])`);
-            continue;
-          }
-
-          // ─── 0.2. DEBE TENER BLOQUE DE AUTOR ────────────────────────────────
-          // Un post real siempre tiene [data-ad-rendering-role="profile_name"].
-          // Su ausencia descarta headers del grupo, skeletons de carga, ads sin autor, etc.
-          if (!articleEl.querySelector('[data-ad-rendering-role="profile_name"]')) {
-            logs.push(`  art[${idx}] → SKIP (sin profile_name — no es post real)`);
-            continue;
-          }
 
           // ─── 0.5. DETECCIÓN DE SHARE (estructural) ──────────────────────────
           // FB no siempre renderiza "compartió la publicación". Detección por estructura:
@@ -378,7 +457,8 @@ export async function extractPostsFromGroup(
     await page.mouse.move(vp.width / 2, vp.height / 2);
     await page.mouse.wheel(0, 1500);
     // 3. Esperar a que Facebook cargue el lote nuevo de posts
-    await page.waitForTimeout(randomDelay(3000, 5000));
+    //    (delay generoso: FB tarda en hidratar los articles tras el scroll)
+    await page.waitForTimeout(randomDelay(9000, 12000));
     await capture();
 
     if (postsMap.size === prevSize) {
