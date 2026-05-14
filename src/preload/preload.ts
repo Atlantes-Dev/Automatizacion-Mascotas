@@ -29,6 +29,8 @@ const api = {
   stopExtraction: () => ipcRenderer.invoke('extraction:stop'),
   getExtractionState: () => ipcRenderer.invoke('extraction:getState'),
   getExtractionRuns: () => ipcRenderer.invoke('extraction:getRuns'),
+  getExtractionRunsWithStats: () => ipcRenderer.invoke('extraction:getRunsWithStats'),
+  getExtractionRunPosts: (runId: number) => ipcRenderer.invoke('extraction:getRunPosts', runId),
 
   // Playwright
   checkChromium: () => ipcRenderer.invoke('playwright:checkChromium'),

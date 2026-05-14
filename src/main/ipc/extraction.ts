@@ -88,6 +88,12 @@ async function runExtractionJob(): Promise<void> {
     INSERT OR IGNORE INTO pets (group_id, post_url, author_name, author_url, text, images, published_at)
     VALUES (?, ?, ?, ?, ?, ?, ?)
   `);
+  const getPetIdByUrl = db.prepare(`SELECT id FROM pets WHERE post_url = ?`);
+  // INSERT OR IGNORE: si un post aparece dos veces en el mismo run (por scroll duplicado),
+  // solo se registra una vez gracias al PK compuesto (run_id, pet_id).
+  const insertRunPost = db.prepare(`
+    INSERT OR IGNORE INTO extraction_run_posts (run_id, pet_id, is_new) VALUES (?, ?, ?)
+  `);
   const markGroupScanned = db.prepare(`UPDATE groups SET last_scanned_at = datetime('now', 'localtime') WHERE id = ?`);
 
   const groupsByAccount = new Map<number, typeof groups>();
@@ -168,7 +174,15 @@ async function runExtractionJob(): Promise<void> {
               JSON.stringify(p.images),
               p.publishedAt
             );
-            if (r.changes > 0) saved++;
+            const isNew = r.changes > 0;
+            if (isNew) saved++;
+
+            // Buscar el pet_id (tanto si lo acabamos de insertar como si ya existía)
+            // para registrar la aparición en este run.
+            const row = getPetIdByUrl.get(p.postUrl) as { id: number } | undefined;
+            if (row && state.runId !== null) {
+              insertRunPost.run(state.runId, row.id, isNew ? 1 : 0);
+            }
           }
 
           markGroupScanned.run(g.id);
@@ -253,5 +267,55 @@ export function registerExtractionHandlers(ipcMain: IpcMain): void {
     return getDb()
       .prepare('SELECT * FROM extraction_runs ORDER BY started_at DESC LIMIT 50')
       .all();
+  });
+
+  // Lista de recopilaciones con contadores derivados de extraction_run_posts.
+  // 'posts_seen' = total de posts vistos (incluyendo repetidos de runs previos).
+  // 'posts_new'  = posts que fueron nuevos en ESTE run.
+  ipcMain.handle('extraction:getRunsWithStats', () => {
+    return getDb()
+      .prepare(`
+        SELECT
+          r.id,
+          r.started_at,
+          r.finished_at,
+          r.groups_total,
+          r.groups_done,
+          r.posts_found,
+          r.status,
+          COALESCE(SUM(CASE WHEN erp.pet_id IS NOT NULL THEN 1 ELSE 0 END), 0) AS posts_seen,
+          COALESCE(SUM(CASE WHEN erp.is_new = 1 THEN 1 ELSE 0 END), 0) AS posts_new
+        FROM extraction_runs r
+        LEFT JOIN extraction_run_posts erp ON erp.run_id = r.id
+        GROUP BY r.id
+        ORDER BY r.started_at DESC
+        LIMIT 100
+      `)
+      .all();
+  });
+
+  // Posts capturados en un run específico, con el flag is_new y el nombre del grupo.
+  ipcMain.handle('extraction:getRunPosts', (_e, runId: number) => {
+    return getDb()
+      .prepare(`
+        SELECT
+          p.id,
+          p.post_url,
+          p.author_name,
+          p.author_url,
+          p.text,
+          p.images,
+          p.status,
+          p.collected_at,
+          g.name AS group_name,
+          erp.is_new,
+          erp.seen_at
+        FROM extraction_run_posts erp
+        JOIN pets p ON p.id = erp.pet_id
+        LEFT JOIN groups g ON g.id = p.group_id
+        WHERE erp.run_id = ?
+        ORDER BY erp.is_new DESC, erp.seen_at DESC
+      `)
+      .all(runId);
   });
 }

@@ -143,9 +143,88 @@ export async function extractPostsFromGroup(
   const postsMap = new Map<string, ExtractedPost>();
   let captureRound = 0;
 
+  // FB trunca textos largos a ~360ch y muestra un botón "Ver más" inline dentro del
+  // story_message. Lo expandimos antes de cada captura para guardar el texto completo.
+  //
+  // Solo objetivo: botones cuyo textContent === "Ver más" (o traducciones) y que viven
+  // dentro de un contenedor de mensaje — así NO clickamos "Ver más comentarios",
+  // "Ver más respuestas", "Ver más fotos", etc.
+  //
+  // El click DEBE ir por Playwright (page.locator().dispatchEvent) y NO por element.click()
+  // dentro de evaluate(). FB ignora clicks con isTrusted=false como anti-bot, así que
+  // necesitamos un evento sintetizado por el navegador. Playwright lo logra inyectando
+  // via CDP. Usamos dispatchEvent en lugar de click() para evitar el scroll-into-view
+  // automático que interferiría con nuestro infinite scroll.
+  const expandSeeMore = async (): Promise<number> => {
+    // 1) Localizar todos los "Ver más" candidatos en el feed via evaluate, devolviendo
+    //    índices para poder atacarlos via Playwright sin tener que generar selectores.
+    const candidateCount = await page.evaluate(() => {
+      const feedEl = document.querySelector('[role="feed"]');
+      if (!feedEl) {
+        (window as any).__seeMoreNodes = [];
+        return 0;
+      }
+      const targets = new Set(['ver más', 'ver mas', 'see more', 'ver mais', 'voir plus']);
+      const containers = feedEl.querySelectorAll(
+        '[data-ad-rendering-role="story_message"], ' +
+        '[data-ad-preview="message"], ' +
+        '[data-ad-comet-preview="message"]'
+      );
+      const nodes: HTMLElement[] = [];
+      for (const container of Array.from(containers)) {
+        const buttons = container.querySelectorAll(
+          '[role="button"], div[tabindex="0"], span[role="button"]'
+        );
+        for (const btn of Array.from(buttons) as HTMLElement[]) {
+          const txt = (btn.textContent || '').trim().toLowerCase();
+          if (!targets.has(txt)) continue;
+          nodes.push(btn);
+        }
+      }
+      // Guardamos referencia para que Playwright pueda re-localizarlos via JSHandle.
+      (window as any).__seeMoreNodes = nodes;
+      return nodes.length;
+    });
+
+    if (candidateCount === 0) return 0;
+
+    // 2) Clickar cada nodo via Playwright. Usamos evaluateHandle para recuperar el
+    //    ElementHandle, luego loc.click() (trusted event). force:true evita waitFor
+    //    visibilidad/estabilidad estricta — el nodo ya lo seleccionamos arriba.
+    let clicked = 0;
+    for (let i = 0; i < candidateCount; i++) {
+      try {
+        const handle = await page.evaluateHandle((idx) => {
+          const arr: HTMLElement[] = (window as any).__seeMoreNodes || [];
+          return arr[idx] || null;
+        }, i);
+        const el = handle.asElement();
+        if (!el) { await handle.dispose(); continue; }
+        // dispatchEvent('click') usa la API de Playwright que envía un evento
+        // sintetizado por el navegador (trusted en CDP). No scrollea.
+        await el.dispatchEvent('click');
+        clicked++;
+        await handle.dispose();
+      } catch (_) { /* ignore individual fallos */ }
+    }
+
+    // 3) Liberar la referencia global y esperar a que React rehidrate.
+    await page.evaluate(() => { delete (window as any).__seeMoreNodes; });
+    if (clicked > 0) {
+      await page.waitForTimeout(randomDelay(800, 1400));
+    }
+    return clicked;
+  };
+
   const capture = async () => {
     captureRound++;
     type EvalResult = { posts: ExtractedPost[]; logs: string[] };
+
+    console.log(`\n[postsExtractor] ── capture() ronda ${captureRound} ──`);
+    const expandedCount = await expandSeeMore();
+    if (expandedCount > 0) {
+      console.log(`[postsExtractor] expandidos ${expandedCount} "Ver más"`);
+    }
 
     const { posts: captured, logs } = await page.evaluate((groupUrl): EvalResult => {
       const logs: string[] = [];
@@ -430,8 +509,7 @@ export async function extractPostsFromGroup(
       return { posts: out, logs };
     }, groupUrl);
 
-    // Imprimir logs en la terminal de Node.js / VS Code
-    console.log(`\n[postsExtractor] ── capture() ronda ${captureRound} ──`);
+    // Imprimir logs del evaluate (el header de la ronda ya se imprimió arriba).
     for (const line of logs) console.log(`[postsExtractor] ${line}`);
     console.log(`[postsExtractor] → ${captured.length} post(s) en esta pasada | acumulado: ${postsMap.size}`);
 

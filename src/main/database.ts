@@ -66,6 +66,21 @@ function createTables(): void {
       status TEXT NOT NULL DEFAULT 'running' CHECK(status IN ('running', 'completed', 'failed', 'stopped'))
     );
 
+    -- Cada post visto en cada run. Un post puede aparecer en N runs (reapariciones).
+    -- 'is_new' = 1 si esta fue la primera vez que se vio (insert efectivo en pets);
+    -- 'is_new' = 0 si ya existía (INSERT OR IGNORE descartó).
+    CREATE TABLE IF NOT EXISTS extraction_run_posts (
+      run_id INTEGER NOT NULL,
+      pet_id INTEGER NOT NULL,
+      is_new INTEGER NOT NULL DEFAULT 0,
+      seen_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+      PRIMARY KEY (run_id, pet_id),
+      FOREIGN KEY (run_id) REFERENCES extraction_runs(id) ON DELETE CASCADE,
+      FOREIGN KEY (pet_id) REFERENCES pets(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_erp_run ON extraction_run_posts(run_id);
+
     CREATE TABLE IF NOT EXISTS settings (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL DEFAULT ''
