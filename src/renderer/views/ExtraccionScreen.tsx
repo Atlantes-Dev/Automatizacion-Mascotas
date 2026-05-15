@@ -18,6 +18,8 @@ interface ExtractionConfig {
   onlyLostPets: boolean;
   delayBetweenGroupsMin: number;
   delayBetweenGroupsMax: number;
+  incrementalMode: boolean;
+  incrementalStopAfter: number;
 }
 
 interface RunWithStats {
@@ -104,6 +106,8 @@ const ExtraccionScreen: React.FC = () => {
     onlyLostPets: true,
     delayBetweenGroupsMin: 8,
     delayBetweenGroupsMax: 20,
+    incrementalMode: true,
+    incrementalStopAfter: 3,
   });
 
   const [runs, setRuns] = useState<RunWithStats[]>([]);
@@ -236,6 +240,31 @@ const ExtraccionScreen: React.FC = () => {
               onChange={(v) => saveConfig({ ...config, onlyLostPets: v })}
             />
           </div>
+          <div className="flex items-center justify-between">
+            <div className="min-w-0 pr-2">
+              <label className="text-xs text-neutral-300 block">Modo incremental</label>
+              <p className="text-[10px] text-neutral-500 leading-tight mt-0.5">
+                Corta el scroll cuando llega a posts ya conocidos.
+              </p>
+            </div>
+            <ToggleSwitch
+              checked={config.incrementalMode}
+              onChange={(v) => saveConfig({ ...config, incrementalMode: v })}
+            />
+          </div>
+          {config.incrementalMode && (
+            <div className="flex items-center justify-between pl-3 border-l-2 border-accent-500/30">
+              <label className="text-xs text-neutral-400">Rondas sin nuevos antes de cortar</label>
+              <input
+                type="number"
+                min={1}
+                max={10}
+                value={config.incrementalStopAfter}
+                onChange={(e) => saveConfig({ ...config, incrementalStopAfter: parseInt(e.target.value || '3', 10) })}
+                className="w-16 bg-neutral-800 border border-neutral-700 text-neutral-200 text-xs rounded px-2 py-1 focus:outline-none focus:border-accent-500"
+              />
+            </div>
+          )}
           <div className="flex items-center justify-between">
             <label className="text-xs text-neutral-300">Scrolls máximos por grupo</label>
             <input
@@ -481,7 +510,6 @@ const PostRow: React.FC<{ post: RunPost; accent?: boolean }> = ({ post, accent }
   let images: string[] = [];
   try { images = JSON.parse(post.images || '[]'); } catch { /* ignore */ }
   const thumb = images[0];
-  const preview = (post.text || '').slice(0, 140);
 
   return (
     <div className={`flex gap-2.5 p-2 rounded-md ${accent ? 'bg-accent-500/5 border border-accent-500/15' : 'bg-neutral-900/40 border border-neutral-800/60'}`}>
@@ -506,8 +534,9 @@ const PostRow: React.FC<{ post: RunPost; accent?: boolean }> = ({ post, accent }
             <span className="text-neutral-600 truncate">· {post.group_name}</span>
           )}
         </div>
-        <p className="text-[11.5px] text-neutral-400 mt-0.5 line-clamp-2 leading-snug">
-          {preview || <span className="italic text-neutral-600">(sin texto)</span>}
+        {/* Texto completo — sin slice ni line-clamp. whitespace-pre-wrap respeta saltos de línea del post. */}
+        <p className="text-[11.5px] text-neutral-300 mt-0.5 leading-snug whitespace-pre-wrap break-words">
+          {post.text || <span className="italic text-neutral-600">(sin texto)</span>}
         </p>
       </div>
       <a

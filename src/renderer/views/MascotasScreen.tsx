@@ -142,8 +142,9 @@ const MascotasScreen: React.FC = () => {
                         </div>
                         <StatusBadge status={pet.status} />
                       </div>
-                      <div className={`text-xs text-neutral-300 leading-relaxed ${isOpen ? '' : 'line-clamp-3'}`}>
-                        {pet.text}
+                      {/* Texto completo siempre. whitespace-pre-wrap respeta saltos de línea originales. */}
+                      <div className="text-xs text-neutral-300 leading-relaxed whitespace-pre-wrap break-words">
+                        {pet.text || <span className="italic text-neutral-600">(sin texto)</span>}
                       </div>
                       <div className="flex items-center gap-2 mt-2">
                         <a

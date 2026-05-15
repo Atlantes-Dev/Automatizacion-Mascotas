@@ -26,6 +26,8 @@ export function registerSettingsHandlers(ipcMain: IpcMain): void {
       onlyLostPets: getSetting('only_lost_pets', '1') === '1',
       delayBetweenGroupsMin: parseInt(getSetting('delay_between_groups_min', '8'), 10),
       delayBetweenGroupsMax: parseInt(getSetting('delay_between_groups_max', '20'), 10),
+      incrementalMode: getSetting('incremental_mode', '1') === '1',
+      incrementalStopAfter: parseInt(getSetting('incremental_stop_after', '3'), 10),
     };
   });
 
@@ -34,11 +36,15 @@ export function registerSettingsHandlers(ipcMain: IpcMain): void {
     onlyLostPets: boolean;
     delayBetweenGroupsMin: number;
     delayBetweenGroupsMax: number;
+    incrementalMode: boolean;
+    incrementalStopAfter: number;
   }) => {
     setSetting('max_scrolls_per_group', String(cfg.maxScrollsPerGroup));
     setSetting('only_lost_pets', cfg.onlyLostPets ? '1' : '0');
     setSetting('delay_between_groups_min', String(cfg.delayBetweenGroupsMin));
     setSetting('delay_between_groups_max', String(cfg.delayBetweenGroupsMax));
+    setSetting('incremental_mode', cfg.incrementalMode ? '1' : '0');
+    setSetting('incremental_stop_after', String(cfg.incrementalStopAfter));
     return true;
   });
 }

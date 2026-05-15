@@ -57,6 +57,16 @@ async function runExtractionJob(): Promise<void> {
   emit('extraction:status', { message: `Iniciando extracción de ${groups.length} grupo(s)...`, type: 'info' });
   emit('extraction:progress', { done: 0, total: groups.length, found: 0 });
 
+  // Aviso de modo incremental al inicio del run (no por cada grupo).
+  const incModeOn = ((db.prepare('SELECT value FROM settings WHERE key = ?').get('incremental_mode') as any)?.value || '1') === '1';
+  if (incModeOn) {
+    const knownTotal = (db.prepare('SELECT COUNT(*) AS c FROM pets').get() as any).c;
+    emit('extraction:status', {
+      message: `Modo incremental activo · ${knownTotal} post(s) conocido(s) en BD`,
+      type: 'info',
+    });
+  }
+
   const cfg = {
     maxScrollsPerGroup: parseInt(
       (db.prepare('SELECT value FROM settings WHERE key = ?').get('max_scrolls_per_group') as any)?.value || '15',
@@ -70,6 +80,12 @@ async function runExtractionJob(): Promise<void> {
     ),
     delayMax: parseInt(
       (db.prepare('SELECT value FROM settings WHERE key = ?').get('delay_between_groups_max') as any)?.value || '20',
+      10
+    ),
+    incrementalMode:
+      ((db.prepare('SELECT value FROM settings WHERE key = ?').get('incremental_mode') as any)?.value || '1') === '1',
+    incrementalStopAfter: parseInt(
+      (db.prepare('SELECT value FROM settings WHERE key = ?').get('incremental_stop_after') as any)?.value || '3',
       10
     ),
   };
@@ -158,9 +174,23 @@ async function runExtractionJob(): Promise<void> {
         emit('extraction:status', { message: `Escaneando "${g.name}"...`, type: 'info' });
 
         try {
+          // ─── Modo incremental: pre-cargar URLs ya conocidas ───────────────────
+          // Si está activo, leemos TODOS los post_url ya en BD (globales — no solo
+          // del grupo actual) para que cross-group shares también se detecten como
+          // conocidos. El extractor usa este Set para decidir cuándo cortar el scroll.
+          // Se re-consulta por grupo para que los posts insertados entre grupos
+          // anteriores ya cuenten como "conocidos" al procesar este.
+          let knownUrls: Set<string> | undefined = undefined;
+          if (cfg.incrementalMode) {
+            const rows = db.prepare('SELECT post_url FROM pets').all() as Array<{ post_url: string }>;
+            knownUrls = new Set(rows.map((r) => r.post_url));
+          }
+
           const posts = await extractPostsFromGroup(page, g.url, {
             maxScrolls: cfg.maxScrollsPerGroup,
             onlyLostPets: cfg.onlyLostPets,
+            knownUrls,
+            incrementalStopAfter: cfg.incrementalStopAfter,
           });
 
           let saved = 0;

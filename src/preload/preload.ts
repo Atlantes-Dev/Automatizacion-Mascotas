@@ -45,6 +45,8 @@ const api = {
     onlyLostPets: boolean;
     delayBetweenGroupsMin: number;
     delayBetweenGroupsMax: number;
+    incrementalMode: boolean;
+    incrementalStopAfter: number;
   }) => ipcRenderer.invoke('settings:setExtractionConfig', cfg),
 
   // Eventos

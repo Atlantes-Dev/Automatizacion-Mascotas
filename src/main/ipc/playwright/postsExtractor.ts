@@ -51,13 +51,111 @@ async function resolveOriginalPost(_page: Page, post: ExtractedPost): Promise<Ex
   return post;
 }
 
+// Cambia el orden del feed del grupo a "Nuevas publicaciones" (orden cronológico real).
+// Por defecto FB usa "Actividad reciente", que reordena por comentarios nuevos — eso rompe
+// el scraping incremental porque un post viejo con un comentario fresco aparecería al tope
+// del feed. "Nuevas publicaciones" garantiza orden por fecha de publicación.
+//
+// Flujo:
+//   1. Detectar el botón "Ordenar feed del grupo por: <modo>" y leer el modo actual.
+//   2. Si ya está en "Nuevas publicaciones", no hacemos nada.
+//   3. Click en el botón (vía Playwright dispatchEvent — trusted) para abrir el menú.
+//   4. Esperar a que aparezcan los [role="menuitemradio"].
+//   5. Click en la opción "Nuevas publicaciones".
+//   6. Esperar al re-render del feed y verificar que el botón ahora dice "Nuevas publicaciones".
+async function switchToNewestPosts(page: Page): Promise<boolean> {
+  try {
+    const currentMode = await page.evaluate(() => {
+      const btn = (Array.from(document.querySelectorAll('[role="button"]')) as HTMLElement[])
+        .find((el) => /ordenar feed del grupo por/i.test(el.innerText || ''));
+      if (!btn) return 'no-encontrado';
+      const txt = (btn.innerText || '').toLowerCase();
+      if (/nuevas publicaciones/.test(txt)) return 'nuevas';
+      if (/actividad reciente/.test(txt)) return 'actividad';
+      return 'desconocido';
+    });
+
+    if (currentMode === 'no-encontrado') {
+      console.log('[postsExtractor] (sort) Botón de orden no presente — saltando');
+      return false;
+    }
+    if (currentMode === 'nuevas') {
+      console.log('[postsExtractor] (sort) Feed ya está en "Nuevas publicaciones"');
+      return true;
+    }
+    console.log(`[postsExtractor] (sort) Modo actual: ${currentMode} → cambiando a "Nuevas publicaciones"`);
+
+    // Abrir el menú
+    const sortHandle = await page.evaluateHandle(() =>
+      (Array.from(document.querySelectorAll('[role="button"]')) as HTMLElement[])
+        .find((el) => /ordenar feed del grupo por/i.test(el.innerText || '')) || null
+    );
+    const sortEl = sortHandle.asElement();
+    if (!sortEl) { await sortHandle.dispose(); return false; }
+    await sortEl.dispatchEvent('click');
+    await sortHandle.dispose();
+
+    // Esperar a que aparezcan las opciones
+    try {
+      await page.waitForSelector('[role="menuitemradio"]', { timeout: 5000 });
+    } catch {
+      console.log('[postsExtractor] (sort) El menú no apareció tras click');
+      return false;
+    }
+    await page.waitForTimeout(randomDelay(400, 800));
+
+    // Click en "Nuevas publicaciones"
+    const optHandle = await page.evaluateHandle(() =>
+      (Array.from(document.querySelectorAll('[role="menuitemradio"]')) as HTMLElement[])
+        .find((el) => /nuevas publicaciones/i.test(el.innerText || '')) || null
+    );
+    const optEl = optHandle.asElement();
+    if (!optEl) {
+      await optHandle.dispose();
+      console.log('[postsExtractor] (sort) Opción "Nuevas publicaciones" no hallada en el menú');
+      return false;
+    }
+    await optEl.dispatchEvent('click');
+    await optHandle.dispose();
+
+    // Esperar al re-render
+    await page.waitForTimeout(randomDelay(2500, 4000));
+
+    // Verificación: el texto del botón de sort ahora debe decir "Nuevas publicaciones"
+    const verified = await page.evaluate(() => {
+      const btn = (Array.from(document.querySelectorAll('[role="button"]')) as HTMLElement[])
+        .find((el) => /ordenar feed del grupo por/i.test(el.innerText || ''));
+      return btn ? /nuevas publicaciones/i.test(btn.innerText || '') : false;
+    });
+    console.log(`[postsExtractor] (sort) Cambio confirmado: ${verified ? 'OK' : 'NO'}`);
+    return verified;
+  } catch (e: any) {
+    console.log(`[postsExtractor] (sort) Error: ${e?.message}`);
+    return false;
+  }
+}
+
 export async function extractPostsFromGroup(
   page: Page,
   groupUrl: string,
-  options: { maxScrolls?: number; onlyLostPets?: boolean } = {}
+  options: {
+    maxScrolls?: number;
+    onlyLostPets?: boolean;
+    // ─── Modo incremental ───────────────────────────────────────────────────
+    // Si se pasa un Set de URLs ya conocidas (de la BD), el extractor cuenta
+    // cuántas rondas seguidas no traen posts nuevos y corta cuando ese contador
+    // alcanza `incrementalStopAfter`. Esto solo tiene sentido si el feed está
+    // ordenado cronológicamente (switchToNewestPosts), porque depende de que
+    // los posts viejos aparezcan AL FINAL del scroll.
+    knownUrls?: Set<string>;
+    incrementalStopAfter?: number;
+  } = {}
 ): Promise<ExtractedPost[]> {
   const maxScrolls = options.maxScrolls ?? 15;
   const onlyLostPets = options.onlyLostPets ?? true;
+  const knownUrls = options.knownUrls;
+  const incrementalStopAfter = options.incrementalStopAfter ?? 3;
+  const incrementalEnabled = !!knownUrls;
 
   console.log(`[postsExtractor] Navegando a ${groupUrl}`);
   const ok = await safeGoto(page, groupUrl, 60000);
@@ -70,6 +168,12 @@ export async function extractPostsFromGroup(
     document.querySelector('input[name="email"], form[action*="login"]') !== null
   );
   if (isLoginPage) throw new Error('Sesión expirada — volver a iniciar sesión en Cuentas');
+
+  // Cambiar el orden del feed a "Nuevas publicaciones" (orden cronológico real).
+  // Esto es importante para extracciones diarias: con "Actividad reciente" un post viejo
+  // con un comentario nuevo aparecería al tope, lo cual confundiría tanto al filtro como
+  // a un futuro modo incremental ("cortar cuando lleguemos a posts ya conocidos").
+  await switchToNewestPosts(page);
 
   // ─── DIAGNÓSTICO FORENSE ─────────────────────────────────────────────────
   // Vuelca: screenshot + HTML completo + métricas DOM clave + URL final.
@@ -303,22 +407,45 @@ export async function extractPostsFromGroup(
           // Para shares con sourceEl=wrapper (fallback): se mezclan sharer + original, lo
           //   cual no es ideal pero sirve para keyword matching.
           // Su AUSENCIA combinada con presencia de imágenes = post solo-imagen (válido).
+          //
+          // ⚠ Deduplicación: FB a veces renderiza el mismo texto en dos contenedores
+          //   (story_message + ad_preview_message) — sibling o anidado. Filtramos:
+          //   (a) descartar bloques anidados dentro de otro bloque ya capturado,
+          //   (b) descartar bloques con texto idéntico al de otro ya capturado.
+          //
+          // ⚠ Limpieza de "Ver más"/"Ver menos": tras expandir un post, FB cambia
+          //   el botón a "Ver menos" — su textContent queda como sufijo. Lo strippeamos.
+          const stripTrailingButton = (s: string): string =>
+            s.replace(/\s*(?:\.{3}\s*)?(ver más|ver mas|ver menos|see more|see less|ver mais|ver menos|voir plus|voir moins)\s*$/i, '').trim();
+
           let text = '';
-          const textBlocks = sourceEl.querySelectorAll(
+          const allTextBlocks = Array.from(sourceEl.querySelectorAll(
             '[data-ad-rendering-role="story_message"], [data-ad-preview="message"], [data-ad-comet-preview="message"]'
-          );
-          if (textBlocks.length > 0) {
-            text = Array.from(textBlocks).map((b) => (b.textContent || '').trim()).join('\n');
+          )) as HTMLElement[];
+
+          const textsKept: string[] = [];
+          const seenTexts = new Set<string>();
+          for (const block of allTextBlocks) {
+            // (a) Anidado dentro de otro bloque que ya capturamos? skip.
+            if (allTextBlocks.some((other) => other !== block && other.contains(block))) continue;
+            const cleaned = stripTrailingButton((block.textContent || '').trim());
+            if (!cleaned) continue;
+            // (b) Texto idéntico al de otro bloque ya guardado? skip.
+            if (seenTexts.has(cleaned)) continue;
+            seenTexts.add(cleaned);
+            textsKept.push(cleaned);
           }
+          text = textsKept.join('\n');
+
           if (!text) {
             const parts: string[] = [];
             for (const d of Array.from(sourceEl.querySelectorAll('div[dir="auto"]'))) {
-              const t = (d.textContent || '').trim();
+              const t = stripTrailingButton((d.textContent || '').trim());
               if (t.length > 10 && !parts.includes(t)) parts.push(t);
             }
             text = parts.join('\n').trim();
           }
-          const hasStoryMessage = textBlocks.length > 0;
+          const hasStoryMessage = allTextBlocks.length > 0;
 
           // ─── 2. IMÁGENES ─────────────────────────────────────────────────────
           // Todos los pases sobre sourceEl: para shares con embedded esto restringe a las
@@ -511,19 +638,32 @@ export async function extractPostsFromGroup(
 
     // Imprimir logs del evaluate (el header de la ronda ya se imprimió arriba).
     for (const line of logs) console.log(`[postsExtractor] ${line}`);
-    console.log(`[postsExtractor] → ${captured.length} post(s) en esta pasada | acumulado: ${postsMap.size}`);
+
+    // Contar cuántos posts de ESTA ronda no estaban ya en la BD (knownUrls).
+    // Si el modo incremental está activo, lo usamos para decidir si cortar pronto.
+    let newToDb = 0;
+    if (incrementalEnabled) {
+      for (const p of captured) {
+        if (!knownUrls!.has(p.postUrl)) newToDb++;
+      }
+    }
+    const incTag = incrementalEnabled ? ` | nuevos-vs-BD: ${newToDb}/${captured.length}` : '';
+    console.log(`[postsExtractor] → ${captured.length} post(s) en esta pasada | acumulado: ${postsMap.size}${incTag}`);
 
     for (const post of captured) {
       if (postsMap.has(post.postUrl)) continue;
       const enriched = await resolveOriginalPost(page, post);
       postsMap.set(enriched.postUrl, enriched);
     }
+    return { newToDb };
   };
 
   await capture();
 
   let prevSize = postsMap.size;
   let stableRounds = 0;
+  // Modo incremental: rondas consecutivas con 0 posts nuevos respecto a BD.
+  let consecutiveKnownRounds = 0;
 
   // Tamaño del viewport para centrar el mouse (necesario para que mouse.wheel funcione)
   const vp = page.viewportSize() ?? { width: 1280, height: 720 };
@@ -537,7 +677,22 @@ export async function extractPostsFromGroup(
     // 3. Esperar a que Facebook cargue el lote nuevo de posts
     //    (delay generoso: FB tarda en hidratar los articles tras el scroll)
     await page.waitForTimeout(randomDelay(9000, 12000));
-    await capture();
+    const { newToDb } = await capture();
+
+    // ─── Corte temprano por modo incremental ──────────────────────────────────
+    // Si traemos 0 nuevos respecto a BD K rondas seguidas, asumimos que ya hemos
+    // pasado la frontera con lo escaneado previamente y cortamos.
+    if (incrementalEnabled) {
+      if (newToDb === 0) {
+        consecutiveKnownRounds++;
+        if (consecutiveKnownRounds >= incrementalStopAfter) {
+          console.log(`[postsExtractor] ✂ Corte incremental: ${incrementalStopAfter} ronda(s) sin posts nuevos vs BD`);
+          break;
+        }
+      } else {
+        consecutiveKnownRounds = 0;
+      }
+    }
 
     if (postsMap.size === prevSize) {
       stableRounds++;
