@@ -149,6 +149,10 @@ export async function extractPostsFromGroup(
     // los posts viejos aparezcan AL FINAL del scroll.
     knownUrls?: Set<string>;
     incrementalStopAfter?: number;
+    // Callback que devuelve true cuando el proceso principal pidió detener.
+    // Se comprueba al inicio de cada ronda de scroll — el extractor rompe el
+    // bucle y devuelve los posts ya acumulados para que se guarden parcialmente.
+    shouldStop?: () => boolean;
   } = {}
 ): Promise<ExtractedPost[]> {
   const maxScrolls = options.maxScrolls ?? 15;
@@ -669,6 +673,11 @@ export async function extractPostsFromGroup(
   const vp = page.viewportSize() ?? { width: 1280, height: 720 };
 
   for (let i = 0; i < maxScrolls; i++) {
+    if (options.shouldStop?.()) {
+      console.log('[postsExtractor] ✂ Detenido por señal externa — guardando parcial');
+      break;
+    }
+
     // 1. Scroll al fondo absoluto → activa el IntersectionObserver del sentinel de Facebook
     await page.evaluate(SCROLL_TO_BOTTOM_FN);
     // 2. mouse.wheel simula interacción real del usuario, refuerza el scroll event

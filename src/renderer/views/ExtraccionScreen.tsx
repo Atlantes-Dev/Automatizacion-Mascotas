@@ -97,6 +97,43 @@ const STATUS_LABEL: Record<RunWithStats['status'], string> = {
   stopped: 'Detenida',
 };
 
+// ─── NUMERIC INPUT ────────────────────────────────────────────────────────────
+// Los <input type="number"> con min/max devuelven e.target.value="" cuando el
+// valor en pantalla viola el límite (p.ej. borrar "15" deja "1" < min=3), lo que
+// provoca que el campo se congele porque el || 'fallback' del onChange lo resetea.
+// Solución: type="text" + inputMode="numeric" con estado de borrador local.
+// Solo se persiste en el padre cuando el valor es válido; onBlur normaliza al mínimo.
+const NumericInput: React.FC<{
+  value: number;
+  min?: number;
+  onChange: (val: number) => void;
+  className?: string;
+}> = ({ value, min = 1, onChange, className }) => {
+  const [draft, setDraft] = useState<string | null>(null);
+
+  return (
+    <input
+      type="text"
+      inputMode="numeric"
+      value={draft !== null ? draft : String(value)}
+      onChange={(e) => {
+        const cleaned = e.target.value.replace(/[^0-9]/g, '');
+        setDraft(cleaned);
+        const parsed = parseInt(cleaned, 10);
+        if (!isNaN(parsed) && parsed >= min) onChange(parsed);
+      }}
+      onBlur={(e) => {
+        const parsed = parseInt(e.target.value, 10);
+        const final = isNaN(parsed) || parsed < min ? min : parsed;
+        onChange(final);
+        setDraft(null);
+      }}
+      onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
+      className={className}
+    />
+  );
+};
+
 // ─── COMPONENTE ───────────────────────────────────────────────────────────────
 const ExtraccionScreen: React.FC = () => {
   const [running, setRunning] = useState(false);
@@ -255,45 +292,37 @@ const ExtraccionScreen: React.FC = () => {
           {config.incrementalMode && (
             <div className="flex items-center justify-between pl-3 border-l-2 border-accent-500/30">
               <label className="text-xs text-neutral-400">Rondas sin nuevos antes de cortar</label>
-              <input
-                type="number"
-                min={1}
-                max={10}
+              <NumericInput
                 value={config.incrementalStopAfter}
-                onChange={(e) => saveConfig({ ...config, incrementalStopAfter: parseInt(e.target.value || '3', 10) })}
+                min={1}
+                onChange={(val) => saveConfig({ ...config, incrementalStopAfter: val })}
                 className="w-16 bg-neutral-800 border border-neutral-700 text-neutral-200 text-xs rounded px-2 py-1 focus:outline-none focus:border-accent-500"
               />
             </div>
           )}
           <div className="flex items-center justify-between">
             <label className="text-xs text-neutral-300">Scrolls máximos por grupo</label>
-            <input
-              type="number"
-              min={3}
-              max={50}
+            <NumericInput
               value={config.maxScrollsPerGroup}
-              onChange={(e) => saveConfig({ ...config, maxScrollsPerGroup: parseInt(e.target.value || '15', 10) })}
+              min={1}
+              onChange={(val) => saveConfig({ ...config, maxScrollsPerGroup: val })}
               className="w-20 bg-neutral-800 border border-neutral-700 text-neutral-200 text-xs rounded px-2 py-1 focus:outline-none focus:border-accent-500"
             />
           </div>
           <div className="flex items-center justify-between gap-2">
             <label className="text-xs text-neutral-300">Pausa entre grupos (seg)</label>
             <div className="flex items-center gap-1.5">
-              <input
-                type="number"
-                min={1}
-                max={120}
+              <NumericInput
                 value={config.delayBetweenGroupsMin}
-                onChange={(e) => saveConfig({ ...config, delayBetweenGroupsMin: parseInt(e.target.value || '8', 10) })}
+                min={1}
+                onChange={(val) => saveConfig({ ...config, delayBetweenGroupsMin: val })}
                 className="w-16 bg-neutral-800 border border-neutral-700 text-neutral-200 text-xs rounded px-2 py-1 focus:outline-none focus:border-accent-500"
               />
               <span className="text-xs text-neutral-500">a</span>
-              <input
-                type="number"
-                min={1}
-                max={120}
+              <NumericInput
                 value={config.delayBetweenGroupsMax}
-                onChange={(e) => saveConfig({ ...config, delayBetweenGroupsMax: parseInt(e.target.value || '20', 10) })}
+                min={1}
+                onChange={(val) => saveConfig({ ...config, delayBetweenGroupsMax: val })}
                 className="w-16 bg-neutral-800 border border-neutral-700 text-neutral-200 text-xs rounded px-2 py-1 focus:outline-none focus:border-accent-500"
               />
             </div>

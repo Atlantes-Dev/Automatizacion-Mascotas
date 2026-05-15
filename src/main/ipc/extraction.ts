@@ -69,7 +69,7 @@ async function runExtractionJob(): Promise<void> {
 
   const cfg = {
     maxScrollsPerGroup: parseInt(
-      (db.prepare('SELECT value FROM settings WHERE key = ?').get('max_scrolls_per_group') as any)?.value || '15',
+      (db.prepare('SELECT value FROM settings WHERE key = ?').get('max_scrolls_per_group') as any)?.value || '8',
       10
     ),
     onlyLostPets:
@@ -191,6 +191,7 @@ async function runExtractionJob(): Promise<void> {
             onlyLostPets: cfg.onlyLostPets,
             knownUrls,
             incrementalStopAfter: cfg.incrementalStopAfter,
+            shouldStop: () => state.shouldStop,
           });
 
           let saved = 0;
