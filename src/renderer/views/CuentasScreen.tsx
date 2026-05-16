@@ -18,6 +18,7 @@ const CuentasScreen: React.FC = () => {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [sessions, setSessions] = useState<Record<number, boolean>>({});
   const [loggingIn, setLoggingIn] = useState(false);
+  const [rescanningIds, setRescanningIds] = useState<Set<number>>(new Set());
   const [message, setMessage] = useState<{ text: string; type: 'info' | 'error' | 'success' } | null>(null);
 
   const refresh = useCallback(async () => {
@@ -62,6 +63,29 @@ const CuentasScreen: React.FC = () => {
     if (!confirm(`¿Eliminar la cuenta "${name}"? Se borrarán sus grupos y mascotas asociadas.`)) return;
     await window.api.deleteAccount(id);
     await refresh();
+  };
+
+  const rescanGroups = async (id: number, name: string) => {
+    setRescanningIds((prev) => new Set(prev).add(id));
+    setMessage({ text: `Buscando grupos nuevos de "${name}"...`, type: 'info' });
+    try {
+      const result = await window.api.rescanGroups(id) as any;
+      if (result.success) {
+        setMessage({
+          text: result.newGroupsCount > 0
+            ? `Se encontraron ${result.newGroupsCount} grupo(s) nuevo(s) de ${result.totalGroupsCount} en total.`
+            : `Sin grupos nuevos. (${result.totalGroupsCount} grupos detectados en total)`,
+          type: result.newGroupsCount > 0 ? 'success' : 'info',
+        });
+        await refresh();
+      } else {
+        setMessage({ text: result.error || 'No se pudo actualizar los grupos.', type: 'error' });
+      }
+    } catch (err: any) {
+      setMessage({ text: err.message, type: 'error' });
+    } finally {
+      setRescanningIds((prev) => { const next = new Set(prev); next.delete(id); return next; });
+    }
   };
 
   return (
@@ -130,6 +154,20 @@ const CuentasScreen: React.FC = () => {
                   }`}>
                     {sessions[acc.id] ? 'Sesión activa' : 'Sesión expirada'}
                   </span>
+
+                  <button
+                    onClick={() => rescanGroups(acc.id, acc.name)}
+                    disabled={rescanningIds.has(acc.id)}
+                    title="Actualizar grupos"
+                    className="p-1.5 text-neutral-500 hover:text-accent-400 hover:bg-accent-900/20 disabled:opacity-40 rounded-md transition-colors"
+                  >
+                    <svg
+                      className={`w-4 h-4 ${rescanningIds.has(acc.id) ? 'animate-spin' : ''}`}
+                      fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75}
+                    >
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182m0-4.991v4.99" />
+                    </svg>
+                  </button>
 
                   <button
                     onClick={() => removeAccount(acc.id, acc.name)}

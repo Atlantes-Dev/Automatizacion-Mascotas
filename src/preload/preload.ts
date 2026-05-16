@@ -35,6 +35,7 @@ const api = {
   // Playwright
   checkChromium: () => ipcRenderer.invoke('playwright:checkChromium'),
   openLoginWindow: () => ipcRenderer.invoke('playwright:openLogin'),
+  rescanGroups: (accountId: number) => ipcRenderer.invoke('accounts:rescanGroups', accountId),
 
   // Settings
   getSetting: (key: string) => ipcRenderer.invoke('settings:get', key),

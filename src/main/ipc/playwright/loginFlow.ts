@@ -6,6 +6,7 @@ import { getDb } from '../../database';
 import { randomDelay, safeGoto, randomViewport, randomUserAgent, getStealthScript } from './helpers';
 import { extractGroupsComplete } from './groupExtractor';
 import { getBrowserExecutablePath } from './chromium';
+import { activeProfiles } from './profileLock';
 
 export async function runLoginFlow(): Promise<{
   success: boolean;
@@ -211,5 +212,98 @@ export async function runLoginFlow(): Promise<{
       }
     } catch { /* ignorar */ }
     return { success: false, error: error.message };
+  }
+}
+
+export async function rescanGroupsForAccount(accountId: number): Promise<{
+  success: boolean;
+  newGroupsCount?: number;
+  totalGroupsCount?: number;
+  error?: string;
+}> {
+  if (activeProfiles.has(accountId)) {
+    return { success: false, error: 'La cuenta está en uso actualmente (extracción en curso).' };
+  }
+
+  const execPath = getBrowserExecutablePath();
+  if (!execPath) {
+    return { success: false, error: 'No se encontró ningún navegador instalado (Chrome, Edge o Brave).' };
+  }
+
+  const db = getDb();
+  const account = db.prepare('SELECT id, name FROM accounts WHERE id = ?').get(accountId) as any;
+  if (!account) {
+    return { success: false, error: 'Cuenta no encontrada.' };
+  }
+
+  const profileDir = path.join(app.getPath('userData'), 'profiles', `account_${accountId}`);
+  if (!fs.existsSync(profileDir)) {
+    return { success: false, error: 'El perfil de la cuenta no existe en disco.' };
+  }
+
+  const lockFile = path.join(profileDir, 'SingletonLock');
+  if (fs.existsSync(lockFile)) {
+    try { fs.rmSync(lockFile); } catch { /* ignorar */ }
+  }
+
+  activeProfiles.add(accountId);
+  let context: BrowserContext | null = null;
+
+  try {
+    const ua = randomUserAgent();
+    context = await chromium.launchPersistentContext(profileDir, {
+      headless: true,
+      executablePath: execPath,
+      ignoreDefaultArgs: ['--enable-automation'],
+      args: [
+        '--disable-blink-features=AutomationControlled',
+        '--disable-infobars',
+        '--no-first-run',
+        '--no-default-browser-check',
+        '--disable-dev-shm-usage',
+        '--disk-cache-size=52428800',
+        '--test-type',
+      ],
+      viewport: randomViewport(),
+      locale: 'es-ES',
+      userAgent: ua,
+    });
+
+    await context.addInitScript({ content: getStealthScript(ua) });
+    const page: Page = await context.newPage();
+    const boundSafeGoto = (url: string, timeout?: number) => safeGoto(page, url, timeout);
+
+    console.log(`[rescanGroups] Extrayendo grupos para cuenta #${accountId}...`);
+    const groups = await extractGroupsComplete(
+      page,
+      'https://www.facebook.com/groups/joins/?nav_source=tab&ordering=viewer_added',
+      boundSafeGoto
+    );
+    console.log(`[rescanGroups] Grupos encontrados: ${groups.length}`);
+
+    const insertGroup = db.prepare(
+      'INSERT OR IGNORE INTO groups (account_id, name, url, monitored) VALUES (?, ?, ?, 0)'
+    );
+    let newGroupsCount = 0;
+    const seen = new Set<string>();
+    for (const g of groups) {
+      if (!seen.has(g.url)) {
+        const result = insertGroup.run(accountId, g.name, g.url);
+        if ((result as any).changes > 0) newGroupsCount++;
+        seen.add(g.url);
+      }
+    }
+
+    await context.close();
+    context = null;
+    return { success: true, newGroupsCount, totalGroupsCount: groups.length };
+  } catch (error: any) {
+    console.error('[rescanGroups] Error:', error.message);
+    return { success: false, error: error.message };
+  } finally {
+    activeProfiles.delete(accountId);
+    if (context) {
+      try { await context.close(); } catch { /* ignorar */ }
+    }
   }
 }
