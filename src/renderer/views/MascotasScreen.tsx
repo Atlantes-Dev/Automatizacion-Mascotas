@@ -19,6 +19,34 @@ interface Pet {
 
 const STATUSES = ['nuevo', 'revisado', 'contactado', 'descartado'] as const;
 
+const STATUS_META: Record<string, { label: string; dot: string; text: string }> = {
+  nuevo:      { label: 'Nuevo',      dot: 'bg-orange-500',  text: 'text-orange-400' },
+  revisado:   { label: 'Revisado',   dot: 'bg-blue-500',    text: 'text-blue-400' },
+  contactado: { label: 'Contactado', dot: 'bg-emerald-500', text: 'text-emerald-400' },
+  descartado: { label: 'Descartado', dot: 'bg-neutral-500', text: 'text-neutral-400' },
+};
+
+const MONTHS_ES = ['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre'];
+
+function todayStr(): string {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
+
+function formatDayLabel(dateStr: string): string {
+  const day = dateStr.split(' ')[0];
+  const today = todayStr();
+  if (day === today) return 'Hoy';
+
+  const yd = new Date(); yd.setDate(yd.getDate() - 1);
+  const yest = `${yd.getFullYear()}-${String(yd.getMonth()+1).padStart(2,'0')}-${String(yd.getDate()).padStart(2,'0')}`;
+  if (day === yest) return 'Ayer';
+
+  const [y, m, d2] = day.split('-').map(Number);
+  const label = `${d2} de ${MONTHS_ES[m - 1]}`;
+  return y === new Date().getFullYear() ? label : `${label} de ${y}`;
+}
+
 function parseImages(raw: string): string[] {
   try { return JSON.parse(raw) as string[]; } catch { return []; }
 }
@@ -123,8 +151,71 @@ const Lightbox: React.FC<{
   );
 };
 
+// ─── CONTEXT MENU ─────────────────────────────────────────────────────────────
+const PetContextMenu: React.FC<{
+  currentStatus: string;
+  x: number;
+  y: number;
+  onSelect: (status: string) => void;
+  onClose: () => void;
+}> = ({ currentStatus, x, y, onSelect, onClose }) => {
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const onMouse = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) onClose();
+    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    document.addEventListener('mousedown', onMouse);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onMouse);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [onClose]);
+
+  const W = 172, H = 164;
+  const left = x + W > window.innerWidth  ? x - W : x;
+  const top  = y + H > window.innerHeight ? y - H : y;
+
+  return (
+    <div
+      ref={ref}
+      className="fixed z-[80] bg-neutral-800 border border-neutral-600/70 rounded-xl shadow-2xl py-1.5 overflow-hidden"
+      style={{ left, top, minWidth: W }}
+    >
+      <p className="text-[9px] text-neutral-600 uppercase tracking-widest px-3 py-1">Cambiar estado</p>
+      {STATUSES.map((s) => {
+        const m = STATUS_META[s];
+        const active = s === currentStatus;
+        return (
+          <button
+            key={s}
+            onMouseDown={(e) => { e.stopPropagation(); onSelect(s); onClose(); }}
+            className={`w-full flex items-center gap-2.5 px-3 py-2 text-left text-xs transition-colors ${
+              active ? 'bg-neutral-700/70' : 'hover:bg-neutral-700/40'
+            } ${m.text}`}
+          >
+            <span className={`w-2 h-2 rounded-full flex-shrink-0 ${m.dot} ${active ? '' : 'opacity-50'}`} />
+            <span className={active ? 'font-medium' : ''}>{m.label}</span>
+            {active && (
+              <svg className="w-3 h-3 ml-auto" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+              </svg>
+            )}
+          </button>
+        );
+      })}
+    </div>
+  );
+};
+
 // ─── CARD ─────────────────────────────────────────────────────────────────────
-const PetCard: React.FC<{ pet: Pet; onClick: () => void }> = ({ pet, onClick }) => {
+const PetCard: React.FC<{
+  pet: Pet;
+  onClick: () => void;
+  onRightClick: (x: number, y: number) => void;
+}> = ({ pet, onClick, onRightClick }) => {
   const images = parseImages(pet.images);
   const thumb = images[0] ?? null;
 
@@ -138,6 +229,8 @@ const PetCard: React.FC<{ pet: Pet; onClick: () => void }> = ({ pet, onClick }) 
   return (
     <div
       onClick={onClick}
+      onContextMenu={(e) => { e.preventDefault(); onRightClick(e.clientX, e.clientY); }}
+      title="Clic para ver detalle · Clic derecho para cambiar estado"
       className="group bg-neutral-800/60 rounded-xl border border-neutral-700/40 hover:border-neutral-500/60 hover:bg-neutral-800/90 transition-all cursor-pointer overflow-hidden flex flex-col"
     >
       {/* Imagen */}
@@ -363,6 +456,7 @@ const MascotasScreen: React.FC = () => {
   const [statusFilter, setStatusFilter] = useState<string>('todos');
   const [search, setSearch] = useState('');
   const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [ctxMenu, setCtxMenu] = useState<{ petId: number; x: number; y: number } | null>(null);
 
   const refresh = useCallback(async () => {
     const filter = statusFilter === 'todos' ? undefined : { status: statusFilter };
@@ -387,6 +481,20 @@ const MascotasScreen: React.FC = () => {
       p.group_name.toLowerCase().includes(q)
     );
   }, [pets, search]);
+
+  const petsByDay = useMemo(() => {
+    const groups = new Map<string, Pet[]>();
+    for (const pet of filtered) {
+      const day = (pet.collected_at || '').split(' ')[0] || 'unknown';
+      if (!groups.has(day)) groups.set(day, []);
+      groups.get(day)!.push(pet);
+    }
+    return Array.from(groups.entries()).map(([day, list]) => ({
+      day,
+      label: day === 'unknown' ? 'Fecha desconocida' : formatDayLabel(day),
+      pets: list,
+    }));
+  }, [filtered]);
 
   const selectedPet = selectedId !== null ? pets.find((p) => p.id === selectedId) ?? null : null;
 
@@ -457,9 +565,29 @@ const MascotasScreen: React.FC = () => {
             )}
           </div>
         ) : (
-          <div className="grid grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6 gap-3">
-            {filtered.map((pet) => (
-              <PetCard key={pet.id} pet={pet} onClick={() => setSelectedId(pet.id)} />
+          <div className="space-y-7">
+            {petsByDay.map(({ day, label, pets: dayPets }) => (
+              <div key={day}>
+                <div className="flex items-center gap-3 mb-3 sticky top-0 z-10 bg-neutral-900/80 backdrop-blur-sm py-1 -mx-1 px-1 rounded-lg">
+                  <span className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider whitespace-nowrap">
+                    {label}
+                  </span>
+                  <div className="flex-1 h-px bg-neutral-800" />
+                  <span className="text-[10px] text-neutral-600 whitespace-nowrap">
+                    {dayPets.length} post{dayPets.length !== 1 ? 's' : ''}
+                  </span>
+                </div>
+                <div className="grid grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6 gap-3">
+                  {dayPets.map((pet) => (
+                    <PetCard
+                      key={pet.id}
+                      pet={pet}
+                      onClick={() => setSelectedId(pet.id)}
+                      onRightClick={(x, y) => setCtxMenu({ petId: pet.id, x, y })}
+                    />
+                  ))}
+                </div>
+              </div>
             ))}
           </div>
         )}
@@ -475,6 +603,21 @@ const MascotasScreen: React.FC = () => {
           onDelete={removePet}
         />
       )}
+
+      {/* Menú contextual de estado */}
+      {ctxMenu && (() => {
+        const pet = pets.find((p) => p.id === ctxMenu.petId);
+        if (!pet) return null;
+        return (
+          <PetContextMenu
+            currentStatus={pet.status}
+            x={ctxMenu.x}
+            y={ctxMenu.y}
+            onSelect={(s) => updateStatus(ctxMenu.petId, s)}
+            onClose={() => setCtxMenu(null)}
+          />
+        );
+      })()}
     </div>
   );
 };
